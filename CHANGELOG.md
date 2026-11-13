@@ -2,7 +2,25 @@
 
 *Automatically generated from GitHub releases*
 *Source: https://github.com/laobamac/OCLP-Mod*
-*Last update: 2026-01-15 22:27:11*
+*Last update: 2026-11-13*
+
+---
+
+## 3.1.9-mod1
+*Release date: 2026-11-13*
+
+### 解决的核心问题 (Issues Fixed)
+1. **修复 GitHub 下载 429 报错及驱动补丁（KDK）中断问题**：
+   - **智能测速与源排序优化**：在网络直连 GitHub 良好（延迟 <= 3s）时优先直连官方源，大幅提升大文件吞吐率（实测可达 20~54 MB/s），且避免第三方代理限流与分段不兼容。
+   - **动态并发控制**：官方直连启用 6 线程分段并发加速；镜像代理自动降至 2 线程，彻底解决 `ghfast` 等公共镜像并发请求触发 `HTTP 429 Too Many Requests` 导致下载失败的问题。
+   - **Range 预检保护**：下载前进行 Range 预检，对不支持 206 状态码或返回 429 的节点自动降级为单流或自动切源。
+
+2. **多源无缝自动容灾回退（Failover）**：
+   - 任何单一节点遇到 429 限流、网络超时或连接中断时，自动清理临时分片并平滑无缝切换至下一个健康备用源重试，彻底杜绝下载流程报错中断。
+
+3. **清理失效镜像与更新通道**：
+   - 移除已失效的 `download.simplehac.cn`（连接重置）及 `proxy.yaoyaoling.net`（超时死链）。
+   - 修复应用更新检查模块（`gui_update.py`）中对失效域名的硬编码依赖，统一由具备自动容灾的下载器接管。
 
 ---
 
