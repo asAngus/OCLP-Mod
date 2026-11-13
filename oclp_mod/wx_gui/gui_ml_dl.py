@@ -168,9 +168,25 @@ class DownloadProgressFrame(wx.Dialog):
     def _download_file(self) -> None:
         """下载文件"""
         try:
-            # 禁用 SSL 证书验证，允许重定向
-            response = requests.get(self.url, stream=True, verify=False, allow_redirects=True)
-            response.raise_for_status()
+            from ..support.network_handler import get_github_candidate_urls
+            candidate_urls = [self.url]
+            if "github.com" in self.url:
+                candidate_urls = get_github_candidate_urls(self.url)
+
+            response = None
+            last_err = None
+            for download_url in candidate_urls:
+                try:
+                    r = requests.get(download_url, stream=True, verify=False, allow_redirects=True, timeout=30)
+                    r.raise_for_status()
+                    response = r
+                    break
+                except Exception as ex:
+                    last_err = ex
+                    logging.warning(f"gui_ml_dl 下载源 {download_url} 失败: {ex}，尝试备用源...")
+
+            if response is None:
+                raise last_err or Exception("所有下载源均失败")
             
             # 获取文件大小
             total_size = int(response.headers.get('content-length', 0))

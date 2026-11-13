@@ -98,8 +98,7 @@ class UpdateFrame(wx.Frame):
         def _fetch_update() -> None:
             nonlocal download_obj
             file_name = "OCLP-Mod.pkg.zip" if url.endswith(".zip") else "OCLP-Mod.pkg"
-            cnurl = url.replace("https://github.com/", "https://download.simplehac.cn/https://github.com/")
-            download_obj = network_handler.DownloadObject(cnurl, self.constants.payload_path / file_name)
+            download_obj = network_handler.DownloadObject(url, self.constants.payload_path / file_name)
 
         thread = threading.Thread(target=_fetch_update)
         thread.start()

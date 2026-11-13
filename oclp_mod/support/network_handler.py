@@ -24,6 +24,105 @@ SESSION = requests.Session()
 
 settings = Constants()
 
+# GitHub 加速镜像候选列表，"" 表示直连 GitHub
+GITHUB_MIRRORS = [
+    ("", "直连 (GitHub)"),
+    ("https://gh-proxy.com", "gh-proxy"),
+    ("https://ghproxy.net", "ghproxy.net"),
+    ("https://ghfast.top", "ghfast"),
+]
+
+# 多线程分段下载配置
+MULTITHREAD_ENABLED = True
+MULTITHREAD_DEFAULT_THREADS = 6  # 直连时使用的并发线程数
+MULTITHREAD_PROXY_THREADS = 2    # 镜像代理时使用的并发线程数（避免 429 限流）
+MULTITHREAD_MIN_SIZE = 50 * 1024 * 1024  # 小于 50MB 不分段
+MULTITHREAD_CHUNK_SIZE = 4 * 1024 * 1024  # 单线程读取块大小
+
+_fastest_mirror_cache: dict = {"url": None, "timestamp": 0}
+
+
+def _extract_underlying_github_url(url: str) -> str:
+    """
+    识别已被代理前缀包裹的真实 github 链接。
+
+    e.g. https://ghfast.top/https://github.com/a/b/c -> https://github.com/a/b/c
+         https://download.simplehac.cn/https://github.com/a/b/c -> https://github.com/a/b/c
+    """
+    marker = "https://github.com/"
+    http_marker = "http://github.com/"
+    idx = url.find(marker)
+    if idx == -1:
+        idx = url.find(http_marker)
+        if idx == -1:
+            return url
+        marker = http_marker
+    return url[idx:]
+
+
+def get_github_candidate_urls(original_url: str, force: bool = False) -> list:
+    """
+    探测 GitHub 直连及可用加速镜像，返回按可用性与速度排序的候选 URL 列表。
+    直连正常可用时优先使用直连（避免第三方代理 429 限制与 Range 不兼容问题）。
+    """
+    underlying = _extract_underlying_github_url(original_url)
+    if not underlying.startswith("https://github.com/"):
+        return [original_url]
+
+    results = {}
+
+    def _probe(mirror: str, name: str):
+        url = (mirror + "/" + underlying) if mirror else underlying
+        try:
+            t0 = time.time()
+            r = SESSION.head(url, timeout=5, allow_redirects=True, verify=False)
+            if r.status_code < 400:
+                latency = time.time() - t0
+                results[url] = (latency, mirror == "")
+            else:
+                results[url] = (999999.0, False)
+        except Exception:
+            results[url] = (999999.0, False)
+
+    threads = [threading.Thread(target=_probe, args=(m, name)) for m, name in GITHUB_MIRRORS]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # 排序策略：直连在响应良好（<= 3.0s）时优先，避免代理镜像并发限流
+    def _sort_key(item):
+        url, (latency, is_direct) = item
+        score = latency
+        if is_direct and latency <= 3.0:
+            score -= 1.5  # 给予官方直连优先权
+        return score
+
+    valid_candidates = [
+        url for url, data in sorted(results.items(), key=_sort_key)
+        if data[0] < 999999.0
+    ]
+
+    # 保底：若所有探测均超时，确保原始直连和镜像在候选列表中
+    if not valid_candidates:
+        valid_candidates = [underlying]
+        for m, _ in GITHUB_MIRRORS:
+            if m:
+                valid_candidates.append(m + "/" + underlying)
+    elif underlying not in valid_candidates:
+        valid_candidates.append(underlying)
+
+    logging.info(f"GitHub 下载候选源探测完成 (共 {len(valid_candidates)} 个可用): 首选 -> {valid_candidates[0]}")
+    return valid_candidates
+
+
+def get_fastest_github_url(original_url: str, force=False) -> str:
+    """
+    返回最适用的 GitHub 下载 URL。
+    """
+    candidates = get_github_candidate_urls(original_url, force=force)
+    return candidates[0] if candidates else original_url
+
 class DownloadStatus(enum.Enum):
     """
     Enum for download status
@@ -301,15 +400,38 @@ class DownloadObject:
         If unable to get file size, set to zero
         """
 
+        # 若调用方显式提供了大小（如 convert_size 解析出的字节数），直接采用
+        if self.size is not None:
+            try:
+                self.total_file_size = float(self.size)
+                return
+            except (ValueError, TypeError):
+                pass
+
         try:
             result = SESSION.head(self.url, allow_redirects=True, timeout=5, verify=False)
             if 'Content-Length' in result.headers:
                 self.total_file_size = float(result.headers['Content-Length'])
-                if self.size != None:
-                    self.total_file_size = self.convert_size(self.size)
-            else:
-                raise Exception("Content-Length 头部缺失")
+                return
+            # Content-Length 缺失时尝试 Range 请求从 Content-Range 获取大小
+            logging.info("HEAD 获取大小失败，尝试 Range 请求获取文件大小")
+            raise Exception("Content-Length 头部缺失")
         except Exception as e:
+            try:
+                r = SESSION.get(
+                    self.url, stream=True, timeout=10, allow_redirects=True, verify=False,
+                    headers={"Range": "bytes=0-0"}
+                )
+                cr = r.headers.get("Content-Range")
+                if cr and "/" in cr:
+                    total = cr.split("/")[-1]
+                    if total.isdigit():
+                        self.total_file_size = float(total)
+                        r.close()
+                        return
+                r.close()
+            except Exception as re:
+                logging.error(f"Range 获取文件大小失败: {re}")
             logging.error(f"确定文件大小时出错 {self.url}: {str(e)}")
             logging.error("假设文件大小为0")
             self.total_file_size = 0.0
@@ -376,28 +498,85 @@ class DownloadObject:
         utilities.disable_sleep_while_running()
 
         try:
-            # 直接尝试下载，不进行前置网络检测
-            logging.info(f"开始下载: {self.url}")
-            
-            if self._prepare_working_directory(self.filepath) is False:
-                raise Exception(self.error_msg)
+            original_url = self.url
+            underlying = _extract_underlying_github_url(original_url)
+            is_github = underlying.startswith("https://github.com/") or "github.com" in original_url
 
-            # 在下载前获取文件大小
-            self._populate_file_size()
+            if is_github:
+                candidate_urls = get_github_candidate_urls(underlying)
+            else:
+                candidate_urls = [self.url]
 
-            # 使用相同的SESSION确保一致性
-            response = SESSION.get(self.url, stream=True, timeout=30, allow_redirects=True)
-            
-            # 详细记录响应信息
-            logging.info(f"下载响应状态码: {response.status_code}")
-            if response.history:
-                logging.info(f"经历了重定向: {[r.status_code for r in response.history]}")
+            last_error = None
+            for candidate_url in candidate_urls:
+                if self.should_stop:
+                    break
 
-            # 检查响应状态 - 200表示成功
+                self.url = candidate_url
+                self.downloaded_file_size = 0
+                self.start_time = time.time()
+                logging.info(f"开始尝试下载: {self.url}")
+
+                if self._prepare_working_directory(self.filepath) is False:
+                    last_error = Exception(self.error_msg)
+                    break
+
+                self._populate_file_size()
+
+                is_direct = not any(self.url.startswith(m[0]) for m in GITHUB_MIRRORS if m[0])
+                num_threads = MULTITHREAD_DEFAULT_THREADS if is_direct else MULTITHREAD_PROXY_THREADS
+
+                use_multithread = (
+                    MULTITHREAD_ENABLED
+                    and self.total_file_size >= MULTITHREAD_MIN_SIZE
+                    and self.should_checksum is False
+                )
+
+                success = False
+                if use_multithread:
+                    success = self._download_multithread(display_progress, num_threads=num_threads)
+                    if not success and not self.should_stop:
+                        logging.warning(f"多线程分片下载未完成，自动尝试单连接流式下载: {self.url}")
+                        self.downloaded_file_size = 0
+                        self.start_time = time.time()
+                        success = self._download_single_stream(display_progress)
+                else:
+                    success = self._download_single_stream(display_progress)
+
+                if success and self.download_complete:
+                    last_error = None
+                    break
+                else:
+                    err_detail = self.error_msg or "下载不完整或被中断"
+                    last_error = Exception(f"源 {self.url} 下载失败: {err_detail}")
+                    logging.warning(f"{last_error}，自动切换至下一备用源...")
+                    self._cleanup_temp_files()
+
+            if last_error:
+                self.error = True
+                self.error_msg = str(last_error)
+                self.status = DownloadStatus.ERROR
+                logging.error(f"所有可用源均下载失败: {self.error_msg}")
+            else:
+                self.status = DownloadStatus.COMPLETE
+
+        except Exception as e:
+            self.error = True
+            self.error_msg = str(e)
+            self.status = DownloadStatus.ERROR
+            logging.error(f"下载过程遇到未处理异常: {self.error_msg}")
+        finally:
+            utilities.enable_sleep_after_running()
+
+    def _download_single_stream(self, display_progress: bool = False) -> bool:
+        """单连接流式下载"""
+        try:
+            response = SESSION.get(self.url, stream=True, timeout=30, allow_redirects=True, verify=False)
+            logging.info(f"单连接流式下载响应状态码: {response.status_code}")
+
             if response.status_code != 200:
                 raise Exception(f"服务器返回错误状态码: {response.status_code}")
 
-            # 如果_populate_file_size没有获取到大小，尝试从响应头获取
             if self.total_file_size == 0.0 and 'Content-Length' in response.headers:
                 content_length = response.headers['Content-Length']
                 if content_length and content_length.isdigit():
@@ -406,7 +585,7 @@ class DownloadObject:
 
             with open(self.filepath, 'wb') as file:
                 atexit.register(self.stop)
-                for i, chunk in enumerate(response.iter_content(1024 * 1024 * 4)):
+                for i, chunk in enumerate(response.iter_content(MULTITHREAD_CHUNK_SIZE)):
                     if self.should_stop:
                         raise Exception("下载已停止")
                     if chunk:
@@ -415,28 +594,186 @@ class DownloadObject:
                         if self.should_checksum:
                             self._update_checksum(chunk)
                         if display_progress and i % 100 == 0:
-                            # 不要在这里使用日志记录，因为我们会向日志文件中大量写入
                             if self.total_file_size == 0.0:
                                 print(f"已下载 {utilities.human_fmt(self.downloaded_file_size)} 的 {self.filename}")
                             else:
                                 print(f"已下载 {self.get_percent():.2f}% 的 {self.filename} ({utilities.human_fmt(self.get_speed())}/秒) ({self.get_time_remaining():.2f} 秒剩余)")
-                self.download_complete = True
-                logging.info(f"下载完成: {self.filename}")
-                logging.info("统计信息:")
-                logging.info(f"- 已下载大小: {utilities.human_fmt(self.downloaded_file_size)}")
-                logging.info(f"- 经过时间: {(time.time() - self.start_time):.2f} 秒")
-                logging.info(f"- 速度: {utilities.human_fmt(self.downloaded_file_size / (time.time() - self.start_time))}/秒")
-                logging.info(f"- 位置: {self.filepath}")
-        except Exception as e:
-            self.error = True
-            self.error_msg = str(e)
-            self.status = DownloadStatus.ERROR
-            logging.error(f"下载时出错 {self.url}: {self.error_msg}")
-            # 添加详细错误信息
-            logging.error(f"完整错误: {str(e)}")
 
-        self.status = DownloadStatus.COMPLETE
-        utilities.enable_sleep_after_running()
+            self.download_complete = True
+            logging.info(f"单连接下载完成: {self.filename}")
+            logging.info(f"- 已下载大小: {utilities.human_fmt(self.downloaded_file_size)}")
+            logging.info(f"- 经过时间: {(time.time() - self.start_time):.2f} 秒")
+            logging.info(f"- 速度: {utilities.human_fmt(self.downloaded_file_size / max(time.time() - self.start_time, 0.001))}/秒")
+            logging.info(f"- 位置: {self.filepath}")
+            return True
+
+        except Exception as e:
+            logging.error(f"单连接流式下载失败: {e}")
+            if Path(self.filepath).exists():
+                try:
+                    Path(self.filepath).unlink()
+                except Exception:
+                    pass
+            self.error_msg = str(e)
+            return False
+
+    def _download_multithread(self, display_progress: bool = False, num_threads: int = 6) -> bool:
+        """
+        多线程 Range 分段下载。
+        在正式下载前执行 Range 预检，若服务器返回 429 或不支持 Range 则立即返回 False。
+        """
+        total = int(self.total_file_size)
+        threads_count = min(num_threads, total // MULTITHREAD_CHUNK_SIZE or 1)
+        if threads_count < 1:
+            threads_count = 1
+
+        logging.info(f"执行多线程 Range 预检: {self.url}")
+        try:
+            pre_r = SESSION.get(
+                self.url,
+                stream=True,
+                timeout=10,
+                allow_redirects=True,
+                verify=False,
+                headers={"Range": "bytes=0-1023"}
+            )
+            pre_status = pre_r.status_code
+            pre_r.close()
+            if pre_status == 429:
+                logging.warning(f"该源已触发 429 限流，放弃多线程: {self.url}")
+                return False
+            if pre_status != 206:
+                logging.info(f"服务器返回状态码 {pre_status}，不支持 Range 206，放弃多线程")
+                return False
+        except Exception as e:
+            logging.warning(f"Range 预检异常: {e}")
+            return False
+
+        logging.info(f"Range 预检通过，使用 {threads_count} 个连接分片下载: {self.filename}")
+
+        # 预创建文件
+        try:
+            with open(self.filepath, 'wb') as f:
+                f.truncate(total)
+        except Exception as e:
+            logging.error(f"创建占位文件失败: {e}")
+            return False
+
+        part_files = [Path(str(self.filepath) + f".part{i}") for i in range(threads_count)]
+        for pf in part_files:
+            if pf.exists():
+                try:
+                    pf.unlink()
+                except Exception:
+                    pass
+
+        lock = threading.Lock()
+        failed_flag = {"value": False, "error": ""}
+        ranges = []
+
+        segment = total // threads_count
+        for i in range(threads_count):
+            start = i * segment
+            end = total - 1 if i == threads_count - 1 else (i + 1) * segment - 1
+            ranges.append((start, end))
+
+        def _fetch_range(idx: int):
+            if failed_flag["value"] or self.should_stop:
+                return
+            start, end = ranges[idx]
+            part_path = part_files[idx]
+            expected_bytes = end - start + 1
+            written_bytes = 0
+            try:
+                headers = {"Range": f"bytes={start}-{end}"}
+                with SESSION.get(self.url, stream=True, timeout=60, allow_redirects=True, verify=False, headers=headers) as r:
+                    if r.status_code == 429:
+                        raise Exception("429 Too Many Requests")
+                    if r.status_code != 206:
+                        raise Exception(f"分片响应状态码非 206: {r.status_code}")
+
+                    with open(part_path, 'wb') as pf:
+                        for chunk in r.iter_content(MULTITHREAD_CHUNK_SIZE):
+                            if self.should_stop or failed_flag["value"]:
+                                return
+                            if chunk:
+                                pf.write(chunk)
+                                written_bytes += len(chunk)
+                                with lock:
+                                    self.downloaded_file_size += len(chunk)
+
+                if written_bytes != expected_bytes and not self.should_stop and not failed_flag["value"]:
+                    raise Exception(f"分片 {idx} 字节数不一致: 预期 {expected_bytes}, 实际 {written_bytes}")
+
+            except Exception as e:
+                with lock:
+                    if not failed_flag["value"]:
+                        failed_flag["value"] = True
+                        failed_flag["error"] = str(e)
+                        logging.warning(f"分片 {idx} 下载失败: {e}")
+
+        threads = [threading.Thread(target=_fetch_range, args=(i,)) for i in range(threads_count)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        if failed_flag["value"] or self.should_stop:
+            self._cleanup_part_files(part_files)
+            if Path(self.filepath).exists():
+                try:
+                    Path(self.filepath).unlink()
+                except Exception:
+                    pass
+            return False
+
+        # 合并分片
+        try:
+            with open(self.filepath, 'r+b') as out:
+                for i, (start, end) in enumerate(ranges):
+                    part_path = part_files[i]
+                    with open(part_path, 'rb') as pf:
+                        out.seek(start)
+                        while True:
+                            chunk = pf.read(MULTITHREAD_CHUNK_SIZE)
+                            if not chunk:
+                                break
+                            out.write(chunk)
+                    part_path.unlink()
+        except Exception as e:
+            logging.error(f"合并分片文件失败: {e}")
+            self._cleanup_part_files(part_files)
+            if Path(self.filepath).exists():
+                try:
+                    Path(self.filepath).unlink()
+                except Exception:
+                    pass
+            return False
+
+        self.download_complete = True
+        logging.info(f"多线程下载完成: {self.filename}")
+        logging.info("统计信息:")
+        logging.info(f"- 已下载大小: {utilities.human_fmt(self.downloaded_file_size)}")
+        logging.info(f"- 经过时间: {(time.time() - self.start_time):.2f} 秒")
+        logging.info(f"- 速度: {utilities.human_fmt(self.downloaded_file_size / max(time.time() - self.start_time, 0.001))}/秒")
+        logging.info(f"- 位置: {self.filepath}")
+        return True
+
+    def _cleanup_part_files(self, part_files) -> None:
+        for pf in part_files:
+            try:
+                if pf.exists():
+                    pf.unlink()
+            except Exception:
+                pass
+
+    def _cleanup_temp_files(self) -> None:
+        self._cleanup_part_files([Path(str(self.filepath) + f".part{i}") for i in range(16)])
+        if Path(self.filepath).exists():
+            try:
+                Path(self.filepath).unlink()
+            except Exception:
+                pass
 
 
     def get_percent(self) -> float:
